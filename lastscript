@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""
+Телеграм-бот для приема скринов профиля Kleinanzeigen и OCR-анализа.
+Извлекает дату регистрации (Aktiv seit) и другие поля, затем ищет ближайшую
+дату регистрации в базе user_id+date (txt).
+"""
+
+from __future__ import annotations
+
+import io
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Optional
+
+import requests
+from PIL import Image
+import pytesseract
+import python as account_search
+
+
+# === CONFIG (редактируй здесь) ===
+TELEGRAM_BOT_TOKEN = "8501651034:AAH2eoMiqnH05kNJlLf291ru_0aMRLRwmJk"
+TELEGRAM_CHAT_IDS = [
+    "6478058170",
+    "5583690035",
+]
+POLL_SECONDS = 2
+DB_FILE = "known_accounts.txt"  # строки вида: user_id;dd.mm.yyyy
+TESSERACT_CMD = r"D:\sof1\tesseract.exe"  # если пусто — используется системный tesseract
+REQUEST_TIMEOUT = 20
+RUN_SEARCH_PIPELINE = True
+
+BADGE_KEYWORDS = [
+    "TOP Zufriedenheit",
+    "OK Zufriedenheit",
+    "Besonders freundlich",
+    "Besonders zuverlässig",
+    "Sehr freundlich",
+    "Sehr zuverlässig",
+    "Freundlich",
+    "Zuverlässig",
+]
+
+IGNORE_NAME_KEYWORDS = [
+    "Privater Nutzer",
+    "Aktiv seit",
+    "Anzeigen online",
+    "gesamt",
+    "Verkaufsübersicht",
+    "Antwortet",
+    "Follower",
+    "Folge ich",
+    "Sicher bezahlen",
+]
+
+
+@dataclass
+class ParsedProfile:
+    name: Optional[str]
+    aktiv_seit: Optional[str]
+    online_ads: Optional[int]
+    total_ads: Optional[int]
+    followers: Optional[int]
+    response_hours: Optional[int]
+    badges: list[str]
+
+
+def _parse_date(date_str: str) -> Optional[str]:
+    date_str = date_str.strip().replace("/", ".")
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def _to_ordinal(date_str: str) -> int:
+    return datetime.strptime(date_str, "%d.%m.%Y").toordinal()
+
+
+def load_known_accounts(path: Path) -> list[tuple[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if ";" not in line:
+            continue
+        user_id, date_str = [part.strip() for part in line.split(";", 1)]
+        normalized = _parse_date(date_str)
+        if user_id and normalized:
+            rows.append((user_id, normalized))
+    return rows
+
+
+def add_known_account(path: Path, user_id: str, date_str: str) -> None:
+    normalized = _parse_date(date_str)
+    if not normalized:
+        return
+    entry = f"{user_id};{normalized}"
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    if entry in existing:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(entry + "\n")
+
+
+def find_nearest_account(
+    target_date: str, entries: Iterable[tuple[str, str]]
+) -> Optional[tuple[str, str]]:
+    target_ord = _to_ordinal(target_date)
+    best: Optional[tuple[str, str]] = None
+    best_delta: Optional[int] = None
+    for user_id, date_str in entries:
+        delta = abs(_to_ordinal(date_str) - target_ord)
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best = (user_id, date_str)
+    return best
+
+
+def ocr_image(image_bytes: bytes) -> str:
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    image = Image.open(io.BytesIO(image_bytes))
+    return pytesseract.image_to_string(image, lang="deu+eng")
+
+
+def extract_profile(text: str) -> ParsedProfile:
+    aktiv_match = re.search(
+        r"Aktiv\s*seit\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})",
+        text,
+        re.IGNORECASE,
+    )
+    aktiv_seit = _parse_date(aktiv_match.group(1)) if aktiv_match else None
+
+    online_total_match = re.search(
+        r"(\d+)\s+Anzeigen\s+online\s*/\s*(\d+)\s+gesamt",
+        text,
+        re.IGNORECASE,
+    )
+    online_ads = None
+    total_ads = None
+    if online_total_match:
+        online_ads = int(online_total_match.group(1))
+        total_ads = int(online_total_match.group(2))
+    else:
+        online_only = re.search(
+            r"(\d+)\s+Anzeigen\s+online",
+            text,
+            re.IGNORECASE,
+        )
+        if online_only:
+            online_ads = int(online_only.group(1))
+
+    followers_match = re.search(r"(\d+)\s+Follower", text, re.IGNORECASE)
+    followers = int(followers_match.group(1)) if followers_match else None
+
+    response_match = re.search(
+        r"Antwortet\s+in\s+der\s+Regel\s+innerhalb\s+von\s+(\d+)\s+Stunden",
+        text,
+        re.IGNORECASE,
+    )
+    response_hours = int(response_match.group(1)) if response_match else None
+
+    badges = [badge for badge in BADGE_KEYWORDS if badge.lower() in text.lower()]
+
+    name = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(keyword.lower() in line.lower() for keyword in IGNORE_NAME_KEYWORDS):
+            continue
+        if len(line) < 2:
+            continue
+        name = line
+        break
+
+    return ParsedProfile(
+        name=name,
+        aktiv_seit=aktiv_seit,
+        online_ads=online_ads,
+        total_ads=total_ads,
+        followers=followers,
+        response_hours=response_hours,
+        badges=badges,
+    )
+
+
+def send_message(chat_id: str, text: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    response = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+
+def download_file(file_id: str) -> bytes:
+    meta_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+    meta = requests.get(meta_url, params={"file_id": file_id}, timeout=REQUEST_TIMEOUT)
+    meta.raise_for_status()
+    file_path = meta.json()["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    response = requests.get(file_url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.content
+
+
+def format_summary(parsed: ParsedProfile) -> str:
+    lines = [
+        "Имя: " + (parsed.name or "не найдено"),
+        "Дата регистрации: " + (parsed.aktiv_seit or "не найдена"),
+        "Объявления онлайн: "
+        + (
+            str(parsed.online_ads)
+            if parsed.online_ads is not None
+            else "не найдено"
+        ),
+        "Подписчики: "
+        + (str(parsed.followers) if parsed.followers is not None else "не найдено"),
+        "Ответ: "
+        + (
+            f"{parsed.response_hours} часов"
+            if parsed.response_hours is not None
+            else "не найдено"
+        ),
+        "Плашки: " + (", ".join(parsed.badges) if parsed.badges else "не найдены"),
+    ]
+    return "\n".join(lines)
+
+
+def handle_photo(chat_id: str, file_id: str) -> None:
+    image_bytes = download_file(file_id)
+    ocr_text = ocr_image(image_bytes)
+    parsed = extract_profile(ocr_text)
+    process_parsed_profile(parsed, chat_id)
+
+
+def process_parsed_profile(parsed: ParsedProfile, chat_id: str) -> None:
+    summary = format_summary(parsed)
+    send_message(chat_id, summary)
+
+    if not parsed.aktiv_seit:
+        send_message(chat_id, "Не удалось определить дату регистрации.")
+        return
+
+    db_path = Path(DB_FILE)
+    entries = load_known_accounts(db_path)
+    if not entries:
+        send_message(
+            chat_id,
+            "База пустая. Добавь запись вида user_id;dd.mm.yyyy в known_accounts.txt.",
+        )
+        return
+
+    nearest = find_nearest_account(parsed.aktiv_seit, entries)
+    if not nearest:
+        send_message(chat_id, "Не удалось найти ближайший аккаунт в базе.")
+        return
+
+    user_id, date_str = nearest
+    send_message(
+        chat_id,
+        (
+            "Ближайшая запись в базе:\n"
+            f"user_id: {user_id}\n"
+            f"Дата: {date_str}\n"
+            "Эти данные будут стартовой точкой для дальнейшего поиска."
+        ),
+    )
+    if RUN_SEARCH_PIPELINE:
+        run_search_pipeline(parsed, user_id, date_str, chat_id)
+
+
+def build_target_features(parsed: ParsedProfile) -> dict:
+    return {
+        "name": parsed.name,
+        "online_ads": parsed.online_ads,
+        "total_ads": parsed.total_ads,
+        "followers": parsed.followers,
+        "response_hours": parsed.response_hours,
+        "badges": parsed.badges,
+    }
+
+
+def run_search_pipeline(
+    parsed: ParsedProfile, seed_user_id: str, seed_date: str, chat_id: str
+) -> None:
+    if not parsed.aktiv_seit:
+        return
+
+    account_search.CONFIG["start_id"] = int(seed_user_id)
+    account_search.CONFIG["start_date"] = seed_date
+    account_search.CONFIG["target_date"] = parsed.aktiv_seit
+    account_search.CONFIG["target_name"] = parsed.name or ""
+    account_search.CONFIG["target_features"] = build_target_features(parsed)
+
+    send_message(chat_id, "Запускаю поиск по дате регистрации...")
+    candidates = account_search.run_full_pipeline()
+
+    best_match = None
+    for candidate in candidates:
+        if candidate.get("features", {}).get("aktiv_seit") != parsed.aktiv_seit:
+            continue
+        if not best_match or candidate.get("score", 0) > best_match.get("score", 0):
+            best_match = candidate
+
+    if best_match:
+        add_known_account(Path(DB_FILE), str(best_match["id"]), parsed.aktiv_seit)
+        send_message(
+            chat_id,
+            (
+                "Найден аккаунт с совпадающей датой. Добавил в базу:\n"
+                f"user_id: {best_match['id']}\n"
+                f"Дата: {parsed.aktiv_seit}"
+            ),
+        )
+
+
+def parse_manual_fields(text: str) -> ParsedProfile:
+    fields = {
+        "name": None,
+        "aktiv_seit": None,
+        "online_ads": None,
+        "total_ads": None,
+        "followers": None,
+        "response_hours": None,
+        "badges": [],
+    }
+    for part in text.split():
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "name":
+            fields["name"] = value.replace("_", " ")
+        elif key == "date":
+            fields["aktiv_seit"] = _parse_date(value)
+        elif key == "online":
+            fields["online_ads"] = int(value)
+        elif key == "total":
+            fields["total_ads"] = int(value)
+        elif key == "followers":
+            fields["followers"] = int(value)
+        elif key == "response":
+            fields["response_hours"] = int(value)
+        elif key == "badges":
+            fields["badges"] = [b.strip() for b in value.split(",") if b.strip()]
+
+    return ParsedProfile(
+        name=fields["name"],
+        aktiv_seit=fields["aktiv_seit"],
+        online_ads=fields["online_ads"],
+        total_ads=fields["total_ads"],
+        followers=fields["followers"],
+        response_hours=fields["response_hours"],
+        badges=fields["badges"],
+    )
+
+
+def handle_command(chat_id: str, text: str) -> None:
+    if text.startswith("/add "):
+        parts = text.split()
+        if len(parts) < 3:
+            send_message(chat_id, "Формат: /add <user_id> <dd.mm.yyyy>")
+            return
+        user_id = parts[1]
+        date_str = parts[2]
+        add_known_account(Path(DB_FILE), user_id, date_str)
+        send_message(chat_id, f"Добавлено в базу: {user_id};{date_str}")
+        return
+    if text.startswith("/manual "):
+        profile = parse_manual_fields(text[len("/manual ") :])
+        process_parsed_profile(profile, chat_id)
+
+
+def get_updates(offset: Optional[int]) -> dict:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"timeout": 30}
+    if offset is not None:
+        params["offset"] = offset
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+def main() -> None:
+    allowed = set(TELEGRAM_CHAT_IDS)
+    offset = None
+
+    while True:
+        updates = get_updates(offset)
+        for update in updates.get("result", []):
+            offset = update["update_id"] + 1
+            message = update.get("message")
+            if not message:
+                continue
+            chat_id = str(message["chat"]["id"])
+            if chat_id not in allowed:
+                continue
+            if "text" in message:
+                handle_command(chat_id, message["text"])
+            if "photo" in message:
+                file_id = message["photo"][-1]["file_id"]
+                handle_photo(chat_id, file_id)
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
