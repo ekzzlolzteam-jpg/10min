@@ -1,0 +1,145 @@
+"""
+Мониторинг объявлений пользователя на kleinanzeigen.de
+Отправляет новые объявления в Telegram.
+"""
+from __future__ import annotations
+
+import json
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+
+# === CONFIG (редактируй здесь) ===
+# Можно указать один или несколько user_id (профилей) для мониторинга.
+USER_IDS = [
+    "29256528","145728623"]
+CHECK_MINUTES_MIN = 10
+CHECK_MINUTES_MAX = 30
+TELEGRAM_BOT_TOKEN = "8537860116:AAEJKAMSJnopEifCWgp_xyW7zs-oAeW-TCQ"  # получить у @BotFather
+TELEGRAM_CHAT_IDS = [
+    "6478058170","6427709100"  # можно слать в личку боту: укажи свой user_id (@userinfobot)
+]
+STATE_FILE = "state_kleinanzeigen.json"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/121.0.0.0 Safari/537.36"
+)
+REQUEST_TIMEOUT = 15
+
+PROFILE_URL_TEMPLATE = "https://www.kleinanzeigen.de/s-bestandsliste.html?userId={user_id}"
+
+
+@dataclass(frozen=True)
+class Listing:
+    title: str
+    url: str
+
+
+def build_profile_url(user_id: str) -> str:
+    return PROFILE_URL_TEMPLATE.format(user_id=user_id)
+
+
+def fetch_profile_html(url: str) -> str:
+    headers = {"User-Agent": USER_AGENT}
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.text
+
+
+def extract_listings(html: str) -> list[Listing]:
+    soup = BeautifulSoup(html, "html.parser")
+    listings: list[Listing] = []
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+        if "/s-anzeige/" not in href:
+            continue
+        title = link.get_text(strip=True) or "Без названия"
+        full_url = urljoin("https://www.kleinanzeigen.de", href)
+        listings.append(Listing(title=title, url=full_url))
+    unique = {}
+    for listing in listings:
+        unique[listing.url] = listing
+    return list(unique.values())
+
+
+def load_seen(path: Path) -> dict[str, set[str]]:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    seen_by_user: dict[str, set[str]] = {}
+    for user_id, urls in data.get("seen_by_user", {}).items():
+        seen_by_user[user_id] = set(urls)
+    return seen_by_user
+
+
+def save_seen(path: Path, seen_by_user: dict[str, Iterable[str]]) -> None:
+    payload = {
+        "seen_by_user": {
+            user_id: sorted(urls) for user_id, urls in seen_by_user.items()
+        }
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def send_telegram_message(chat_id: str, message: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
+    response = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+
+def notify_new_listings(profile_url: str, new_listings: list[Listing]) -> None:
+    for listing in new_listings:
+        message = (
+            f"Найдено новое объявление:\n"
+            f"Профиль: {profile_url}\n"
+            f"Объявление: {listing.url}\n"
+            f"Название: {listing.title}"
+        )
+        for chat_id in TELEGRAM_CHAT_IDS:
+            send_telegram_message(chat_id, message)
+
+
+def main() -> None:
+    if CHECK_MINUTES_MIN <= 0 or CHECK_MINUTES_MAX <= 0:
+        raise ValueError("CHECK_MINUTES_MIN и CHECK_MINUTES_MAX должны быть больше 0")
+    if CHECK_MINUTES_MIN > CHECK_MINUTES_MAX:
+        raise ValueError("CHECK_MINUTES_MIN не может быть больше CHECK_MINUTES_MAX")
+    if not USER_IDS:
+        raise ValueError("USER_IDS не может быть пустым")
+
+    state_path = Path(STATE_FILE)
+    seen_by_user = load_seen(state_path)
+
+    while True:
+        for user_id in USER_IDS:
+            profile_url = build_profile_url(user_id)
+            html = fetch_profile_html(profile_url)
+            listings = extract_listings(html)
+            current_urls = {listing.url for listing in listings}
+            seen_urls = seen_by_user.get(user_id, set())
+            new_listings = [
+                listing for listing in listings if listing.url not in seen_urls
+            ]
+
+            if new_listings:
+                notify_new_listings(profile_url, new_listings)
+
+            seen_by_user[user_id] = current_urls
+
+        save_seen(state_path, seen_by_user)
+
+        wait_minutes = random.uniform(CHECK_MINUTES_MIN, CHECK_MINUTES_MAX)
+        time.sleep(wait_minutes * 60)
+
+
+if __name__ == "__main__":
+    main()
